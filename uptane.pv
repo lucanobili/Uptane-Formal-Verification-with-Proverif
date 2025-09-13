@@ -1,0 +1,569 @@
+type pkey.	    (* public key *)
+type skey.	    (* private key *)
+type keymat.	(* key material *)
+type result.	(* result of check signature *)
+
+type kID.  (* key identifier *)
+
+(* channel *)
+free cDirector:channel.			(* Primary ECU <-> Director *)
+free cVehicle:channel.          (* Primary ECU <-> Secondary ECU *)
+free cImageRepo:channel.        (* Primary ECU <-> Image Repository *)
+free cTime : channel.           (* Primary ECU <-> Time Server *)
+
+
+(* New Updates files/information *)
+free image1, image2:bitstring [private].
+free newInfo1:bitstring [private].
+free newInfo2:bitstring [private].
+
+(* Signatures *)
+fun pk(keymat):pkey.
+fun sk(keymat):skey.
+fun ok():result.
+fun sign(bitstring, skey): bitstring.
+reduc forall m:bitstring, y:keymat; getmess(sign(m,sk(y))) = m.
+reduc forall m:bitstring, y:keymat; checksign(sign(m,sk(y)), pk(y)) = ok().
+
+(* Hash function *)
+fun h(bitstring): bitstring.
+
+(* Mapping id -> key *)
+fun fkey(pkey) : kID [private].
+reduc forall x:pkey; getkey(fkey(x)) = x.
+
+(* event *)
+event endP1().
+event endP2().
+event endD().
+event endI().
+event endT().
+
+(* query - REACHABILITY *)
+query event(endP1()).
+query event(endP2()).
+query event(endD()).
+query event(endI()).
+query event(endT()).
+
+(* secrecy new image, since encyrption has not been implemented it should be always false *)
+query attacker(image1).
+query attacker(image2).
+
+event director_publish(bitstring, bitstring).
+event image_publish(bitstring, bitstring, bitstring).
+event ecu_installed(bitstring, bitstring, bitstring).
+event ecu_installed_2(bitstring, bitstring, bitstring).
+event primary_send_to_2(bitstring, bitstring, bitstring).
+event director_publish_2(bitstring, bitstring).
+event image_publish_2(bitstring, bitstring, bitstring).
+
+
+(* query - ARBYTRARY SOFTWARE ATTACK *)
+query rc:bitstring, h:bitstring, img:bitstring; event(ecu_installed(rc,h,img)) ==>
+     ( event(image_publish(rc,h,img)) &&
+       event(director_publish(rc,h)) ).
+
+query rc:bitstring, h:bitstring, img:bitstring; event(ecu_installed_2(rc,h,img)) ==>
+     (    event(director_publish_2(rc,h)) ).
+
+
+(*                              TIME SERVER PROCESS pT
+    --------------------------------------------------------------------------------------
+        -- PHASE 1 --
+    • Receives a signed time request from the primary ECU containing two tokens 
+        (TokenS1 and TokenS2), each signed by distinct ECUs (typically, 1' and 2' ECUs).
+    • Verifies signatures of both token layers to authenticate the sender and confirm
+        they are authorized to receive time data.
+        -- PHASE 2 --
+    • Takes the current time (abstracted as the updating of "currentTime")
+    • Sends back a signed response for each requester, including:
+        - The new time value,
+        - Their original token,
+        -> signature(signature(newTime, Token1) + signature (newTime, Token2))
+    -------------------------------------------------------------------------------------
+*)
+
+let pT(kTS: keymat, group:bitstring) =
+    let (id1:bitstring, id2:bitstring, VIN:bitstring, info1:bitstring, info2:bitstring, ReleasCounter1:bitstring, ReleasCounter2:bitstring, hw1:bitstring, hw2:bitstring, timestampVD:bitstring, snapshotVD:bitstring, targetVD:bitstring, rootVD:bitstring,
+        timestampVI:bitstring, snapshotVI:bitstring, targetVI:bitstring, rootVI:bitstring, currentTime:bitstring) = group in
+                (* - PHASE 1 - *)
+    in (cTime, Tokens:bitstring);
+    let (k_id1:kID, SignTokens:bitstring) = Tokens in
+    if checksign(SignTokens, getkey(k_id1)) = ok() then
+    let (TokenS1:bitstring, TokenS2:bitstring) = getmess(SignTokens) in (* TokensS1 <- primary ; TokensS2 <- Secondary *)
+            (* Token S1 VERIFICATION *)
+    let (=k_id1, TokenSign1:bitstring) = TokenS1 in
+    if checksign(TokenSign1, getkey(k_id1)) = ok() then
+    let Token1 = getmess(TokenSign1) in
+            (* Token S2 VERIFICATION *)
+    let (k_id2:kID, TokenSign2:bitstring) = TokenS2 in
+    if checksign(TokenSign2, getkey(k_id2)) = ok() then
+    let Token2 = getmess(TokenSign2) in
+                (* - PHASE 2 - *)
+    let newTime = h(currentTime) in
+    out (cTime, sign(( sign(  (newTime, Token1)  ,sk(kTS)) , sign( (newTime, Token2)  ,sk(kTS))   ), sk(kTS)));
+    event endT();0.
+
+(*                                    SECONDARY ECU p2
+    --------------------------------------------------------------------------------------
+        -- PHASE 1 --    
+  • Constructs and signs a ECU Version Report
+  • Sends the ECU Version Report and a Token for the TimeServer to the Primary.
+  • Waits for and verifies a signed time response from the Time Server (received from the
+        Primary ECU)
+        -- PHASE 2 --
+  • Receives an update from Primary ECU containing:
+      - Signed target metadata (from Director repository),
+      - Signed image metadata (from Image repository).
+  • Performs partial verification checks required by Uptane:
+      - Valid signatures on metadata and image,
+      - Correct target expiration time
+      - Matching image hashes and version alignment.
+  • Install new Image
+    -------------------------------------------------------------------------------------
+*)
+
+
+let p2(kp2: keymat, k_id:kID, infver2:bitstring, pkTarget:pkey , pkTimeServer:pkey, group:bitstring) =
+    let (id1:bitstring, id2:bitstring, VIN:bitstring, info1:bitstring, info2:bitstring, ReleasCounter1:bitstring, ReleasCounter2:bitstring, hw1:bitstring, hw2:bitstring, timestampVD:bitstring, snapshotVD:bitstring, targetVD:bitstring, rootVD:bitstring,
+            timestampVI:bitstring, snapshotVI:bitstring, targetVI:bitstring, rootVI:bitstring, currentTime:bitstring) = group in
+                (* - PHASE 1 - *)
+    new nonce:bitstring;
+    new Token:bitstring;
+    let reportPayload:bitstring = (infver2, id2, nonce) in
+    let ECUVersionReport:bitstring = (k_id, sign(reportPayload,sk(kp2))) in
+    out(cVehicle, ECUVersionReport); 
+    out(cVehicle, (k_id, sign(Token, sk(kp2))));
+
+    in (cVehicle, SignedTokenTime2:bitstring);
+    if checksign(SignedTokenTime2, pkTimeServer) = ok() then
+    let (time:bitstring, TokenR:bitstring) = getmess(SignedTokenTime2) in
+    if TokenR = Token then
+                (* - PHASE 2 - *)
+    in (cVehicle, update:bitstring);
+    let (targetD:bitstring, image:bitstring) = update in
+            (* Target Metadata -- Image from the Director/ImageRepository CHECK --- PARTIAL VERIFICATION *)
+            (*  
+                1. Signature check Target Metadata
+                2. Version of the TargerMetada higher then the last one received
+                3. Metadata has not expired
+                4. ECUId (id2) and HwId(hw2) mathces in the Target Metadata
+                5. Release Counter of the Image higher than the last one received
+                6. Hash of the Image matches the one in the Target Metadata
+            
+            *)
+    if checksign(targetD, pkTarget)= ok() then (* 1 *)
+    let (expirationM: bitstring, targetVDR:bitstring, target1: bitstring, target2: bitstring) = getmess(targetD) in (* 2 *)
+    if targetVDR = h(targetVD) then
+    if h(time) = expirationM || h(h(time)) = expirationM then (* 3 *)
+    let (infoD:bitstring, hImageD:bitstring, ReleasCounterD:bitstring,  =id2, =hw2) = target2 in (* 4 *)
+    if h(ReleasCounter2) = ReleasCounterD  then (* 5 *)
+    if h(image) = hImageD then (* 6 *)
+                (* INSTALL IMGAGE *)
+    event ecu_installed_2(ReleasCounterD, hImageD, image);
+    event endP2();0.
+
+(*                                 PRIMARY ECU  p1
+    -------------------------------------------------------------------------------------
+        -- PHASE 1 --    
+  • Collects ECU Version Report from itself and from a Secondary ECU (`report2`).
+  • Create, Sign Vehicle  and sent Version Manifest VVM (VID, ECUReport1, ECUReport2)
+  • Collect, sign and send Tokens to the TimeServer 
+        -- PHASE 2 --    
+  • Receives TimeServer answer and validate it
+  • Gathers fresh time from the Time Server using a token bundle.
+        -- PHASE 3 --    
+  • Receives and validate signed metadata from both Director and Image repositories,
+         full verification:
+      - Timestamp, Snapshot, and Targets (TUF metadata roles) (ROOT metadata has been abstracted)
+      - ImageRepository Metadata
+      - Image from ImageRepository
+      - Cross-checks Director and ImageRepository Metadata
+        -- PHASE 4 --    
+  • Once all verifications pass, it considers the images valid and:
+      - Forwards the updated time from the TimeServer and Target-Image data+metadata to the Secondary.
+      - Update its firmware
+    -------------------------------------------------------------------------------------
+*)
+let p1(kp1: keymat, k_id:kID, infver1:bitstring, pkRoot:pkey, pkRootI:pkey, pkTimeServer:pkey, group:bitstring) =
+    let (id1:bitstring, id2:bitstring, VIN:bitstring, info1:bitstring, info2:bitstring, ReleasCounter1:bitstring, ReleasCounter2:bitstring, hw1:bitstring, hw2:bitstring, timestampVD:bitstring, snapshotVD:bitstring, targetVD:bitstring, rootVD:bitstring,
+            timestampVI:bitstring, snapshotVI:bitstring, targetVI:bitstring, rootVI:bitstring, currentTime:bitstring) = group in
+                            (* --# PHASE 1 #-- *)
+
+    new nonce:bitstring;(* For the ECU Version Report *)
+    new Token:bitstring;(* For the time server *)
+                                                                                            (* Creates ECU1 VersionReport *)
+    let reportPayload1:bitstring = (infver1, id1, nonce) in
+    let ECUVersionReport1:bitstring = (k_id, sign(reportPayload1,sk(kp1))) in
+                                                                                            (* Receiving ECU2 VersionReport *)
+    in (cVehicle, ECUVersionReport2: bitstring);
+    let (k_id2:kID, SignReport2:bitstring) = ECUVersionReport2 in
+    if checksign(SignReport2, getkey(k_id2)) = ok() then
+    let report2 = getmess(SignReport2) in
+    let (infver2:bitstring, id2:bitstring, nonce2:bitstring) = report2 in
+
+                                                                                (* Receiving the token fot the time server + check signature*)
+    in (cVehicle, TimeToken2: bitstring);
+    let (k_id2:kID, SignToken2:bitstring) = TimeToken2 in
+    if checksign(SignToken2, getkey(k_id2)) = ok() then
+    let Token2RR = getmess(SignToken2) in (* Token sent by Secondary ECU *)
+
+                                                                                            (* Creates and sent VVM to Director *)
+    let VVMpayload:bitstring = (VIN, id1, ECUVersionReport1, ECUVersionReport2) in
+    let VVM:bitstring = (k_id, sign(VVMpayload, sk(kp1))) in
+    out (cDirector, VVM);
+                                                                             (* Create the set ot token for the time server + send to the Time server *)
+    let tokens:bitstring = (  (k_id, sign(Token, sk(kp1)))  , TimeToken2) in     
+    out(cTime, (k_id, sign(tokens, sk(kp1))));   
+    
+                            (* --# PHASE 2 #-- *)   
+                                                                                        (*  Receiving new Time signed with tokens + checks:
+                                                                                            - signature
+                                                                                            - all the tokens are present *)
+    in(cTime, SignedTokensTimeR:bitstring);
+    if checksign(SignedTokensTimeR, pkTimeServer) = ok() then
+    let SignedTokensTime = getmess(SignedTokensTimeR) in
+    let (newTimeSignedS1:bitstring, newTimeSignedS2:bitstring) = SignedTokensTime in
+    if (checksign(newTimeSignedS1, pkTimeServer) = ok() && checksign(newTimeSignedS2, pkTimeServer) = ok()) then
+    let (time:bitstring, Token1R:bitstring) = getmess(newTimeSignedS1) in
+    if Token1R = Token then
+    let (=time, Token2R:bitstring) = getmess(newTimeSignedS2) in
+    if Token2R = Token2RR then
+
+                             (* --# PHASE 3 #-- *)  
+
+                                            (*  /\/ DIRECTOR METADATA \/\  *)
+    (* Get the keys from the ROOT metadata *)
+    in(cDirector, rootMeta:bitstring);
+    if checksign(rootMeta, pkRoot) = ok() then
+    let (kid_time:kID, kid_snap:kID, kid_target:kID, expirationRD:bitstring, VDRoot:bitstring) = getmess(rootMeta) in
+    if VDRoot = rootVD || h(VDRoot) = rootVD then
+    if h(time) = expirationRD || h(h(time)) = expirationRD then 
+    let pkTime = getkey(kid_time) in
+    let pkSnap = getkey(kid_snap) in
+    let pkTarget = getkey(kid_target) in
+
+    (* Get the Timestamp metadata *)
+        (* Check signature *)
+        (* Check if the metadata has expired *)
+        (* Check that version  is > than the last timestamp received *)
+    in (cDirector, mTime:bitstring);
+    if checksign(mTime, pkTime) = ok() then
+    let (expirationT:bitstring, metaSnapVersion:bitstring, hMetaSnap:bitstring, metaTimeVersion:bitstring) = getmess(mTime) in
+    if h(time) = expirationT || h(h(time)) = expirationT then
+    if metaTimeVersion = h(timestampVD) then
+
+    (* Get the Snapshot Metadata *)       
+        (* Check signature *)
+        (* Check if the metadata has expired*)
+        (* Check if the hash of the snapshot metadata in the timestamp matches the actual hash of the snapshot metadata *)
+        (* Check that the version of the Snapshot Metadata in the Timestamp Metadata matches *)
+        (* Check that version is > than the last snapshot received*)
+    in (cDirector, mSnap:bitstring);
+    if checksign(mSnap, pkSnap)= ok() then
+    let (expirationS:bitstring, =metaSnapVersion, metaTargetVersion:bitstring) = getmess(mSnap)  in
+    if h(getmess(mSnap)) = hMetaSnap then
+    if h(time) = expirationS || h(h(time)) = expirationS then
+    if metaSnapVersion = h(snapshotVD) then
+
+    (* Get the Target Metadata *)
+        (* Check signature *)
+        (* check if the version listed in the snapshot is the same of the one in the target metadata *)
+        (* Check if the metadata has expired *)
+        (* check that the version received is > than the older *)
+    in (cDirector, mTarget:bitstring);
+    if checksign(mTarget, pkTarget)= ok() then
+    let (expirationM: bitstring, =metaTargetVersion, target1: bitstring, target2: bitstring) = getmess(mTarget) in
+    if h(time) = expirationM || h(h(time)) = expirationM then
+    if metaTargetVersion = h(targetVD) then 
+
+
+                                            (*  /\/ IMAGE REPOSITORY METADATA \/\  *)
+    (* Get the keys from the ROOT metadata *)
+    in(cImageRepo, rootMetaI:bitstring);
+    if checksign(rootMetaI, pkRootI) = ok() then
+    let (kid_timeI:kID, kid_snapI:kID, kid_targetI:kID, expirationRI:bitstring, VIRoot:bitstring) = getmess(rootMetaI) in
+    if VIRoot = rootVI || h(VIRoot) = rootVI then
+    if h(time) = expirationRI || h(h(time)) = expirationRI then
+    let pkTimeI = getkey(kid_timeI) in
+    let pkSnapI = getkey(kid_snapI) in
+    let pkTargetI = getkey(kid_targetI) in
+
+    (* Get the Timestamp metadata *)
+        (* Check signature *)
+        (* Check if the metadata has expired *)
+        (* Check that version  is > than the last timestamp received *)      
+    in (cImageRepo, mTimeI:bitstring);
+    if checksign(mTimeI, pkTimeI) = ok() then
+    let (expirationTI:bitstring, metaSnapshotVersionI:bitstring, hMetaSnapI:bitstring, metaTimeVersionI:bitstring) = getmess(mTimeI) in
+    if h(time) = expirationTI || h(h(time)) = expirationTI then
+    if metaTimeVersionI = h(timestampVI) then
+
+    (* Get the Snapshot Metadata *)       
+        (* Check signature *)
+        (* Check if the metadata has expired*)
+        (* Check if the hash of the snapshot metadata in the timestamp matches the actual hash of the snapshot metadata *)
+        (* Check that the version of the Snapshot Metadata in the Timestamp Metadata matches *)
+        (* Check that version is > than the last snapshot received*)
+    in (cImageRepo, mSnapI:bitstring);
+    if checksign( mSnapI, pkSnapI) = ok() then
+    let (expirationSI:bitstring, =metaSnapshotVersionI, metaTargetVersionI:bitstring) = getmess(mSnapI)  in
+    if h(getmess(mSnapI)) = hMetaSnapI then
+    if h(time) = expirationSI || h(h(time)) = expirationSI then
+    if metaSnapshotVersionI = h(snapshotVI) then
+
+    (* Get the Target Metadata *)
+        (* Check signature *)
+        (* check if the version listed in the snapshot is the same of the one in the target metadata *)
+        (* Check if the metadata has expired *)
+        (* check that the version received is > than the older *)
+    in (cImageRepo, mTargetI:bitstring);
+    if checksign(mTargetI, pkTargetI)= ok() then
+    let (expirationMI: bitstring, =metaTargetVersionI, target1I: bitstring, target2I: bitstring) = getmess(mTargetI) in
+    if h(time) = expirationMI || h(h(time)) = expirationMI then
+    if metaTargetVersionI = h(targetVI) then 
+
+                                            (*  /\/ IMAGE from IMAGE REPOSITORY \/\  *)   
+    in (cImageRepo, Image1:bitstring);
+    in (cImageRepo, Image2: bitstring);
+
+            (* FULL VERIFICATION *)
+                (* check that the hashes of the metadata match the hash of the image*)
+                (* target director = target image repository (no custom ECU id) *)
+                (* release counter > last release counter [version = releaseCounter] *)
+
+    let (info1D:bitstring,hImage1D:bitstring, ReleasCounter1D:bitstring, =id1, hw1D:bitstring) = target1 in
+    let (info2D:bitstring, hImage2D:bitstring, ReleasCounter2D:bitstring,  =id2, hw2D:bitstring) = target2 in
+
+    let (info1I:bitstring,hImage1I:bitstring, ReleasCounter1I:bitstring, =hw1D) = target1I in
+    let (info2I:bitstring, hImage2I:bitstring, ReleasCounter2I:bitstring,  =hw2D) = target2I in
+ 
+    if ReleasCounter1D = h(ReleasCounter1)  && ReleasCounter1I = h(ReleasCounter1) then
+    if ReleasCounter2D = h(ReleasCounter2)  && ReleasCounter2I = h(ReleasCounter2) then 
+
+    if h(Image1) = hImage1D then
+    if h(Image1) = hImage1I then
+    if h(Image2) = hImage2D then 
+    if h(Image2) = hImage2I  then
+
+
+                             (* --# PHASE 4 #-- *)  
+    (* Primary checks and install new Image *)
+    if hw1D = hw1 then
+    (* other checks already done *)
+
+    (* %%% INSTALLING NEW FIRMWARE %%% *)
+    event ecu_installed(ReleasCounter1D, hImage1D, Image1);
+
+    (* Primary sends to the Secondary ECU the updated time from the TimeServer *)
+    out(cVehicle, newTimeSignedS2);
+
+    (* Primary sends to the secondary director target metadata and the image *)
+    event primary_send_to_2(ReleasCounter2D, hImage2D, Image2);
+    out (cVehicle, (mTarget,Image2));
+
+    event endP1(); 0.
+
+(*                              DIRECTOR PROCESS pD
+    --------------------------------------------------------------------------------------
+        -- PHASE 1 --
+    • Receives the VVM and checks the ECU version report for each ECU listed in the VVM
+        - check signature
+        - check if the information about the current firmware of each ECU matches the one 
+            supposed by the director
+    • Create the Metadata related to the new bundle update
+    • Send the Metadata to the primary ECU
+    -------------------------------------------------------------------------------------
+*)
+let pD(infver1:bitstring, infver2:bitstring,kTime:keymat, kSnap:keymat, kTarget:keymat, kRoot:keymat, group:bitstring) = 
+    let (id1:bitstring, id2:bitstring, VIN:bitstring, info1:bitstring, info2:bitstring, ReleasCounter1:bitstring, ReleasCounter2:bitstring, hw1:bitstring, hw2:bitstring, timestampVD:bitstring, snapshotVD:bitstring, targetVD:bitstring, rootVD:bitstring,
+        timestampVI:bitstring, snapshotVI:bitstring, targetVI:bitstring, rootVI:bitstring, currentTime:bitstring) = group in
+
+    (* receiving and checking VVM *)
+    in (cDirector, VVM:bitstring);
+    let (k_idVVM:kID, VVMs:bitstring) = VVM in
+    let pkVVM = getkey(k_idVVM) in
+    if checksign(VVMs, pkVVM) = ok() then
+        let (VINr:bitstring, id1r:bitstring, report1:bitstring, report2:bitstring) = getmess(VVMs) in
+            if VINr = VIN then
+            if id1r = id1 then
+                        (* verifies primary ECU version report *)
+            let (k_id1:kID, sreport1:bitstring) = report1 in
+            let pk1 = getkey(k_id1) in
+                if checksign(sreport1, pk1) = ok() then
+                    let (=infver1, =id1, nonce1:bitstring) = getmess(sreport1) in 
+                        (* verifies secondary ECU version report *)
+            let (k_id2:kID, sreport2:bitstring) = report2 in
+            let pk2 = getkey(k_id2) in
+                if checksign(sreport2, pk2) = ok() then
+                    let (=infver2, id2r:bitstring, nonce2:bitstring) = getmess(sreport2) in 
+                        if id2r = id2 then
+                            
+                    (* CREATION OF THE METADATA  *)
+
+    let expiration = h(h(currentTime)) in (* the time given from the time server  is currentTime + 1, so the expiration data will be at currentTime+2=TimeServer+1*)
+
+    (* ROOT metadata creation *)
+    let RootMeta = (sign((fkey(pk(kTime)),fkey(pk(kSnap)),fkey(pk(kTarget)), expiration, rootVD), sk(kRoot))) in
+
+    (* Create the Targer Metadata *)
+    let (info1:bitstring, ReleasCounter1:bitstring ) = infver1 in
+    let (info2:bitstring, ReleasCounter2:bitstring ) = infver2 in
+
+    let newReleasCounter1 = h(ReleasCounter1) in 
+    let newReleasCounter2 = h(ReleasCounter2) in 
+
+    let metaTV = h(targetVD) in                 (* Target Metadata Version *)
+
+    let target1 = (newInfo1, h(image1), newReleasCounter1, id1, hw1) in
+    let target2 = (newInfo2, h(image2), newReleasCounter2, id2, hw2) in
+    let MetaTarget = (expiration, metaTV, target1, target2) in
+
+    (* Create the Snapshot metadata *)
+
+    let  metSV = h(snapshotVD) in               (* Snapshot Metadata Verison *)
+    let MetaSnap = (expiration, metSV, metaTV) in
+
+    (* Create the timestamp metadata *)
+
+    let metTV = h(timestampVD) in               (* Timestamp Metadata Version *)
+    let MetaTime = (expiration, metSV, h(MetaSnap), metTV) in (* *)
+
+    event director_publish(newReleasCounter1, h(image1));
+    event director_publish_2(newReleasCounter2, h(image2));
+    (* Send metadata to the primary ECU *)
+    out(cDirector, RootMeta);
+    out(cDirector, sign(MetaTime, sk(kTime)));
+    out(cDirector, sign(MetaSnap, sk(kSnap)));
+    out(cDirector, sign(MetaTarget, sk(kTarget)));
+        
+    event endD();0.
+
+(*                              IMAGE REPOSITORY PROCESS pI
+    --------------------------------------------------------------------------------------
+    • Receives the VVM and checks the ECU version report for each ECU listed in the VVM
+        - check signature
+        - check if the information about the current firmware of each ECU matches the one 
+            supposed by the director
+    • Create the Metadata related to the new bundle update
+    • Send the Metadata to the primary ECU
+    -------------------------------------------------------------------------------------
+*)
+let pI(infver1:bitstring, infver2:bitstring, kTime:keymat, kSnap:keymat, kTarget:keymat, kRoot:keymat, group:bitstring) =
+    let (id1:bitstring, id2:bitstring, VIN:bitstring, info1:bitstring, info2:bitstring, ReleasCounter1:bitstring, ReleasCounter2:bitstring, hw1:bitstring, hw2:bitstring, timestampVD:bitstring, snapshotVD:bitstring, targetVD:bitstring, rootVD:bitstring,
+        timestampVI:bitstring, snapshotVI:bitstring, targetVI:bitstring, rootVI:bitstring, currentTime:bitstring) = group in
+
+    let expiration = h(h(currentTime)) in
+    (* Creation ROOT Metadata *)
+    
+    let RootMeta = (sign((fkey(pk(kTime)),fkey(pk(kSnap)),fkey(pk(kTarget)), expiration, rootVI), sk(kRoot))) in
+
+    (* CREATION OF THE METADATA  *)
+
+    let (info1:bitstring, ReleasCounter1:bitstring ) = infver1 in
+    let (info2:bitstring, ReleasCounter2:bitstring ) = infver2 in
+
+    let newReleasCounter1 = h(ReleasCounter1) in 
+    let newReleasCounter2 = h(ReleasCounter2) in 
+
+    let metaTV = h(targetVI) in(* Target Metadata Version *)
+
+    let target1 = (newInfo1, h(image1), newReleasCounter1, hw1) in
+    let target2 = (newInfo2, h(image2), newReleasCounter2, hw2) in
+    let MetaTarget = (expiration, metaTV, target1, target2) in
+
+    (* Create the Snapshot metadata *)
+
+    let  metSV = h(snapshotVI) in (* Snapshot Metadata Verison *)
+    let MetaSnap = (expiration, metSV, metaTV) in
+
+    (* Create the timestamp metadata for the update *)
+
+    let metTV = h(timestampVI) in    
+    let MetaTime = (expiration, metSV, h(MetaSnap), metTV) in
+
+    event image_publish(newReleasCounter1, h(image1), image1);
+
+    (* Send the update: metadata + images *)
+    out (cImageRepo, RootMeta);
+    out (cImageRepo, sign( MetaTime, sk(kTime)));
+    out (cImageRepo, sign( MetaSnap, sk(kSnap)));
+    out (cImageRepo, sign( MetaTarget, sk(kTarget)));
+    out (cImageRepo, image1);
+    out (cImageRepo, image2);
+
+    event endI(); 0.
+
+process 
+         new kp1:keymat; new kp2:keymat;
+
+         new ksnapshotD:keymat;
+         new ktargetD:keymat;
+         new ktimestampD:keymat;
+
+         new kTimeServer:keymat;
+         
+         new ksnapshotI:keymat;
+         new ktargetI:keymat;
+         new ktimestampI:keymat;
+
+         new kRootD:keymat;
+         new kRootI:keymat;
+
+        (* DEFINE A GROUP OF PAST DATA *)
+        new id1:bitstring;
+        new id2:bitstring;
+        new VIN:bitstring;
+        new info1 : bitstring;
+        new info2 : bitstring;
+        new ReleasCounter1 : bitstring;
+        new ReleasCounter2 : bitstring;
+        new hw1:bitstring;
+        new hw2:bitstring;
+        (* Version of the metadata that has been sent in the last update DIRECTORY *)
+        new timestampVD:bitstring;
+        new snapshotVD:bitstring;
+        new targetVD:bitstring;
+        new rootVD:bitstring;
+        (* Version of the metadata that has been sent in the last update IMAGE REPOSITORY *)
+        new timestampVI:bitstring;
+        new snapshotVI:bitstring;
+        new targetVI:bitstring;
+        new rootVI:bitstring;
+        (* Time 0 of the model *)
+        new currentTime:bitstring;
+
+        let group = (id1, id2, VIN, info1, info2, ReleasCounter1, ReleasCounter2, hw1, hw2, timestampVD, snapshotVD, targetVD, rootVD,
+            timestampVI, snapshotVI, targetVI, rootVI, currentTime) in
+
+         let k_id1 = fkey(pk(kp1)) in
+         let k_id2 = fkey(pk(kp2)) in
+
+         let infver1 = (info1, ReleasCounter1) in
+         let infver2 = (info2, ReleasCounter2) in
+
+         (out(cDirector, pk(kp1)); 0 |
+          out(cDirector, pk(kp2)); 0 |
+
+          out(cDirector, pk(ktimestampD)); 0 |
+          out(cDirector, pk(ksnapshotD)); 0 |
+          out(cDirector, pk(ktargetD)); 0 |
+          out(cDirector, pk(kRootD)); 0 |
+
+          out(cDirector, pk(ktimestampI)); 0 |
+          out(cDirector, pk(ksnapshotI)); 0|
+          out(cDirector, pk(ktargetI)); 0 |
+          out(cDirector, pk(kRootI)); 0 |
+
+
+          out(cDirector, pk(kTimeServer)); 0|
+
+          (* The key from the timeserver should be inside the Root metadata of the Director, for semplicty it is directly passed to each ECU *)
+
+          !p1(kp1, k_id1, infver1, pk(kRootD), pk(kRootI), pk(kTimeServer), group ) | 
+          !p2(kp2, k_id2, infver2, pk(ktargetD ),pk(kTimeServer), group ) | 
+          !pD(infver1, infver2, ktimestampD, ksnapshotD, ktargetD, kRootD, group ) |
+          !pI(infver1, infver2, ktimestampI, ksnapshotI, ktargetI, kRootI, group ) |
+          !pT(kTimeServer, group )
+         )
